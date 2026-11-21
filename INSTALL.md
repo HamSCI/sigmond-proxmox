@@ -2,7 +2,7 @@
 
 > **Audience:** operator
 > **Status:** current
-> **Verified against:** sigmond-appliance v3.93 (blessed 2026-11-19): CODAR timing that holds through dropped samples, an upload store that recovers by itself, and a 7-day limit on CODAR's local spot copy.  What each release changed, and how it was proven: [CHANGELOG.md](CHANGELOG.md).
+> **Verified against:** sigmond v3.94 (blessed 2026-11-21): a release now lives in sigmond, the image repo carries the name sigmond-proxmox, each station reports how it differs from its release, and every release passes a bare-metal install test.  What each release changed, and how it was proven: [CHANGELOG.md](https://github.com/HamSCI/sigmond/blob/main/CHANGELOG.md).
 > **Canonical for:** burning, booting and first-boot wizard of the appliance image
 
 Day-2 operation, troubleshooting beyond §11, remote access and what-not-to-touch live in the [Operator guide](https://github.com/HamSCI/sigmond/blob/main/docs/operator/README.md).
