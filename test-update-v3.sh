@@ -22,6 +22,11 @@
 #             leaves station-web and hamsci-physics unbuilt, so the updated
 #             smd's first run builds them before the idempotence check; and
 #             station-web, restarted, must come up and answer on :8000.
+#             From v3.95 (--to-manifest): a base that pins its components
+#             (v3.94 on) rolls forward as a pinned station does, with
+#             `smd align --manifest <candidate> --apply`; align's dry run must
+#             then plan nothing, and every installed component must stand at
+#             the candidate's row.  G-ter's second roll aligns the same way.
 #   PHASE E-bis — what `smd align` does once the code has moved: bring-up's
 #             manifest step, which from v3.70 runs `hs-uploader migrate`
 #             first, then a restart of hs-uploader.  watermarks.db must sit
@@ -161,11 +166,18 @@ set -u
 # terminal instead of silently at the end of a log nobody is tailing yet.
 usage(){
     cat <<'USAGE'
-usage: test-update-v3.sh [--image <release.img>] [--target <git-ref>] [--resume]
+usage: test-update-v3.sh [--image <release.img>] [--target <git-ref>]
+                         [--to-manifest <candidate.manifest.txt>] [--resume]
 
   --image   release image to roll forward FROM (default: the newest
             sigmond-*-release.img in the rig dir)
   --target  git ref the guest must end up level with (default: origin/main)
+  --to-manifest
+            roll forward the way a station on a pinned release does:
+            `smd align --manifest <this file> --apply`, then hold every
+            component to the file's rows.  Required when the base image
+            pins its components (v3.94 and later); sigmond's target is then
+            the file's sigmond row, and --target is not used.
   --resume  skip the install phases and reuse the nested production PM/VM
             left running by a previous run (probed, never assumed)
 
@@ -192,11 +204,12 @@ env overrides (for a scratch rig; never needed for a normal run):
                        qga-dropin-stale.  (default: empty)
 USAGE
 }
-IMGARG=""; TARGET="origin/main"; RESUME=0
+IMGARG=""; TARGET="origin/main"; RESUME=0; TO_MANIFEST=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --image)  [ $# -ge 2 ] || { echo "--image needs a value" >&2; exit 2; }; IMGARG="$2"; shift 2 ;;
         --target) [ $# -ge 2 ] || { echo "--target needs a value" >&2; exit 2; }; TARGET="$2"; shift 2 ;;
+        --to-manifest) [ $# -ge 2 ] || { echo "--to-manifest needs a value" >&2; exit 2; }; TO_MANIFEST="$2"; shift 2 ;;
         --resume) RESUME=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "unrecognized argument: $1" >&2; usage >&2; exit 2 ;;
@@ -653,6 +666,51 @@ pair_verdict(){
         BEGIN { n = split(warn, a, /[, ]+/); for (i = 1; i <= n; i++) if (a[i] != "") w[a[i]] = 1 }
         { print (($2 in w) ? "WARN" : "FATAL") "|" $1 " " $2 }'
 }
+
+# ── components the candidate adds (--to-manifest only) ──────────────────
+# cand_new: the candidate's rows the base image's manifest lacks (v3.95:
+# chirp-recorder).  align installs such a component, and from then on the
+# base release's own tools see it as an extra: doctor reads "installed live
+# (<sha>) but not in the image manifest" (align records a candidate, never
+# as the blessed manifest), adopt refuses "installed live (<sha>) but not in
+# the manifest", and restore leaves it in place as a stray (plan_restore).
+cand_new(){
+    local n sc
+    while read -r n sc; do
+        [ -n "$(sha_of "$WORK/manifest.rows" "$n")" ] || printf '%s ' "$n"
+    done < "$WORK/candidate.rows"
+}
+# cand_new_drift_pass <pairs-new> <doctor-output>: drop each FATAL drift pair
+# on a cand_new component whose doctor detail is exactly that line, and print
+# the names it dropped.  Every other pair stays.
+cand_new_drift_pass(){
+    local n
+    for n in $(cand_new); do
+        grep -q "^FATAL|$n drift\$" "$1" || continue
+        awk -v c="$n:" '$1 == c {f=1; next} f && /^[^ ]/ {exit} f' "$2" \
+            | grep -q 'drift: installed live .* but not in the image manifest' || continue
+        sed -i "/^FATAL|$n drift\$/d" "$1"
+        printf '%s ' "$n"
+    done
+}
+# adopt_refused_names <adopt-output>: the component of each "installed live
+# ... but not in the manifest" refusal, sorted, one per word.
+adopt_refused_names(){
+    LC_ALL=C sed -nE 's/^(.*[^A-Za-z0-9_.-])?([A-Za-z0-9_.-]+): installed live \(.*\) but not in the manifest.*$/\2/p' "$1" \
+        | LC_ALL=C sort -u | tr '\n' ' '
+}
+# adopt_only_cand_new <adopt-output>: true when adopt refused, and every
+# refusal is a cand_new component's "installed live but not in the manifest".
+adopt_only_cand_new(){
+    local refused want all
+    refused="$(adopt_refused_names "$1")"
+    want="$(cand_new | tr ' ' '\n' | LC_ALL=C sort -u | tr '\n' ' ')"
+    [ -n "$want" ] && [ "$refused" = "$want" ] || return 1
+    # No other refusal: adopt marks each refusal line red (a match green),
+    # so the red lines must be exactly ours.
+    all="$(LC_ALL=C grep -c $'\e\[31m' "$1")"
+    [ "$all" = "$(printf '%s' "$refused" | wc -w)" ]
+}
 # <<< doctor_pairs
 # assert_kinds_parsed <label> <doctor-rc> <kinds-file> <doctor-output>: a
 # doctor that REPORTED findings (exit 1) but from which this parser
@@ -725,6 +783,29 @@ else
     TARGET_SHA="$(git --no-optional-locks -C "$SIGMOND_REPO" rev-parse --short "$TARGET" 2>/dev/null)"
     [ -n "$TARGET_SHA" ] || fatal - "git rev-parse $TARGET failed in $SIGMOND_REPO"
     say "target $TARGET resolves to $TARGET_SHA (devbox-side, in $SIGMOND_REPO)"
+fi
+
+# ── --to-manifest: the candidate a pinned station aligns to ─────────────
+# From v3.94 an image pins every component to its release list (sigmond
+# install --release-list), and `smd update` holds a pinned checkout by
+# design.  Such a station moves to a new version with `smd align`, and a
+# canary moves to a candidate with `smd align --manifest`.  So the forward
+# roll aligns to the candidate manifest, and the target for every component,
+# sigmond included, is that manifest's row.  The rows come from the rig's
+# own file, never from the guest.
+ALIGN_MODE=0
+if [ -n "$TO_MANIFEST" ]; then
+    [ -f "$TO_MANIFEST" ] || fatal - "--to-manifest: no such file: $TO_MANIFEST"
+    CAND_MANIFEST="$(cd "$(dirname "$TO_MANIFEST")" && pwd)/$(basename "$TO_MANIFEST")"
+    components_rows "$CAND_MANIFEST" "$WORK/candidate.rows"
+    CROWS="$(rows_count "$WORK/candidate.rows")"
+    [ "$CROWS" -ge "$MIN_ROWS" ] || fatal "$WORK/candidate.rows" "$(basename "$CAND_MANIFEST") yielded only $CROWS component rows (floor $MIN_ROWS)"
+    [ "$CAND_MANIFEST" != "$MANIFEST" ] || fatal - "--to-manifest names the base image's own manifest: nothing to roll forward to"
+    TARGET="$(basename "$CAND_MANIFEST")"
+    TARGET_SHA="$(sha_of "$WORK/candidate.rows" sigmond)"
+    [ -n "$TARGET_SHA" ] || fatal "$WORK/candidate.rows" "$(basename "$CAND_MANIFEST") has no sigmond row"
+    ALIGN_MODE=1
+    say "forward roll: smd align --manifest $TARGET ($CROWS rows; sigmond $TARGET_SHA)"
 fi
 
 # ── install phases: reuse the sibling, never reimplement ────────────────
@@ -1116,6 +1197,55 @@ say "pre-state: the heartbeat is $([ "$HB_PRE" = 1 ] && echo wired || echo 'not 
 # The sink verdicts (_sp2u_placed) read the same fact.
 SP2_NO_HEARTBEAT=$([ "$HB_PRE" = 1 ] && echo 0 || echo 1)
 
+# ── does the base pin its components? ───────────────────────────────────
+# A base from v3.94 on pins every component (install --release-list), and
+# `smd update` then holds them all, sigmond included: run with plain update,
+# this rig would fail on "sigmond did not reach the target" (v3.95 candidate
+# 2, 2026-11-24 07:34Z) and say nothing of why.  So count the holds first and
+# name the right flag.  An older base held one component this way (ft8_lib),
+# hence the floor.
+gx_ok 900 e2-pins-pre 'smd update' "pre-state: the components the base pins"
+PINS_PRE="$(LC_ALL=C grep -c 'pinned by smd align' "$WORK/e2-pins-pre.out")"
+say "pre-state: smd update holds ${PINS_PRE:-0} component(s) at an align pin"
+if [ "$ALIGN_MODE" = 0 ] && [ "${PINS_PRE:-0}" -ge "$MIN_ROWS" ]; then
+    fatal "$WORK/e2-pins-pre.out" "$IMGBASE pins $PINS_PRE components, so smd update moves none of them by design; a pinned station rolls forward with smd align. Re-run with --to-manifest <candidate>.manifest.txt"
+fi
+
+if [ "$ALIGN_MODE" = 1 ]; then
+# ── the roll, as a pinned station takes it: smd align --manifest ────────
+# The candidate lands the way PHASE F's manifest does (base64, then a
+# checksum), and align runs in a transient unit for the reason the update
+# below does: the guest agent's 128M cap.  align may re-exec itself once
+# sigmond moves; `systemd-run --wait` waits for the unit, so it waits for
+# that too.
+GCAND=/root/u2/candidate.manifest.txt
+CB64="$(base64 -w0 "$CAND_MANIFEST")"
+CSHA="$(sha256sum "$CAND_MANIFEST" | awk '{print $1}')"
+gx_ok 120 e3-inject "
+mkdir -p /root/u2
+echo $CB64 | base64 -d > $GCAND
+sha256sum $GCAND" "inject the candidate manifest"
+[ "$GX_RC" -eq 0 ] || fatal "$WORK/e3-inject.out" "could not write $GCAND in the guest (rc=$GX_RC)"
+[ "$(awk '{print $1; exit}' "$WORK/e3-inject.out")" = "$CSHA" ] \
+    || fatal "$WORK/e3-inject.out" "the candidate manifest did not land intact in the guest"
+say "candidate manifest landed in the guest at $GCAND, sha256 verified ✓"
+say "── smd align --manifest $GCAND --apply (a pinned station's forward roll)"
+gx_ok 3600 e3-align-apply "systemd-run --quiet --wait --pipe --collect --unit=rig-align-apply /bin/bash -lc 'smd align --manifest $GCAND --apply'" "smd align --manifest --apply"
+UPD_RC="$GX_RC"
+say "── full smd align --apply output ──"
+cat "$WORK/e3-align-apply.out"
+say "── end smd align --apply output (rc=$UPD_RC) ──"
+grep -q 'Traceback (most recent call last)' "$WORK/e3-align-apply.out" \
+    && fatal "$WORK/e3-align-apply.out" "smd align --apply printed a Python traceback — smd crashed inside the production root channel"
+grep -qE 'runuser: (may not be used|failed to execute|cannot)' "$WORK/e3-align-apply.out" \
+    && fatal "$WORK/e3-align-apply.out" "smd align --apply hit a runuser failure"
+[ "$UPD_RC" = 0 ] || fatal "$WORK/e3-align-apply.out" "smd align --manifest --apply exited $UPD_RC through the production root channel"
+say "smd align --apply exit 0"
+fi
+
+# The update path below serves a base that does not pin (before v3.94).
+# Left unindented so the history of each line stays readable.
+if [ "$ALIGN_MODE" = 0 ]; then
 # ── the update itself, through the production channel ───────────────────
 say "── smd update --apply (this is the channel that crashed on runuser/PATH)"
 # ⛔ NOT INSIDE THE GUEST AGENT'S OWN CGROUP.  sigmond caps
@@ -1192,7 +1322,17 @@ if [ "$IMG_STAMPS" = 0 ]; then
     esac
 fi
 
+fi   # ALIGN_MODE = 0: the update path
+
 # ── idempotence ─────────────────────────────────────────────────────────
+if [ "$ALIGN_MODE" = 1 ]; then
+    # align's dry run exits 0 when nothing is pending (cmd_align: moves,
+    # rebuilds, refusals, installs, files and restarts all zero), 1 otherwise.
+    gx_ok 900 e4-align-dry "smd align --manifest $GCAND" "smd align (dry, idempotence)"
+    [ "$GX_RC" = 0 ] || fatal "$WORK/e4-align-dry.out" "smd align --manifest (dry) exited $GX_RC after --apply: work remains planned (the summary line names it)"
+    say "idempotent: smd align (dry) exit 0, nothing pending"
+fi
+# The plain update stays a no-op too: on a pinned station it holds each pin.
 say "── smd update (dry) must now be a no-op"
 gx_ok 900 e4-update-dry 'smd update' "smd update (dry, idempotence)"
 DRY_RC="$GX_RC"
@@ -1225,6 +1365,27 @@ sha_equal "$LIVE_SIGMOND" "$TARGET_SHA" \
     || fatal "$WORK/e5-version-post.out" "sigmond is live at $LIVE_SIGMOND but $TARGET is $TARGET_SHA — the update did not reach the target (this is dasi002's silent 3-behind, caught)"
 say "sigmond live $LIVE_SIGMOND == $TARGET $TARGET_SHA ✓"
 
+if [ "$ALIGN_MODE" = 1 ]; then
+# ── every component at its candidate row ────────────────────────────────
+# After align a checkout sits detached at its pin, with no branch to be
+# behind, so "level" means: each installed component at the candidate's
+# commit.  A candidate row the guest has no checkout of is a component align
+# does not install unasked (default: those enabled in topology); it is named,
+# never failed.  A checkout the candidate does not list fails.
+ROWS_BAD=""; ROWS_ABSENT=""; ROWS_OK=0
+while read -r n sl; do
+    sc="$(sha_of "$WORK/candidate.rows" "$n")"
+    if [ -z "$sc" ]; then ROWS_BAD="$ROWS_BAD$n($sl, not in the candidate) "
+    elif sha_equal "$sl" "$sc"; then ROWS_OK=$((ROWS_OK + 1))
+    else ROWS_BAD="$ROWS_BAD$n($sl, candidate $sc) "; fi
+done < "$WORK/live-post.rows"
+while read -r n sc; do
+    [ -n "$(sha_of "$WORK/live-post.rows" "$n")" ] || ROWS_ABSENT="$ROWS_ABSENT$n "
+done < "$WORK/candidate.rows"
+[ -z "$ROWS_BAD" ] || fatal "$WORK/e5-version-post.out" "after smd align --apply these components do not stand at the candidate's commit: $ROWS_BAD"
+[ "$ROWS_OK" -ge "$MIN_ROWS" ] || fatal "$WORK/e5-version-post.out" "only $ROWS_OK component(s) matched the candidate (floor $MIN_ROWS): the check measured almost nothing"
+say "every installed component stands at the candidate's commit ✓ ($ROWS_OK matched${ROWS_ABSENT:+; in the candidate, not on this station: $ROWS_ABSENT})"
+else
 # Every OTHER component tracks its own upstream, not this rig's --target,
 # so "level" for them means "nothing left to pull".  Asking git directly
 # (after smd's own fetch, which `smd update` did by default above) is the
@@ -1265,6 +1426,7 @@ ASSESSED="$(awk '$1=="BEHIND"' "$WORK/e6-behind.out" | awk 'END{print NR}')"
 [ "$ASSESSED" -ge "$MIN_ROWS" ] || fatal "$WORK/e6-behind.out" "only $ASSESSED component(s) could be assessed for upstream distance (floor $MIN_ROWS) — the level-with-upstream check measured almost nothing and would have passed regardless. Not assessed: ${NOUP:-none reported}"
 [ -z "$NOUP" ] && say "every component checkout is level with its upstream ✓ ($ASSESSED assessed)" \
                || say "every component with an upstream is level ✓ ($ASSESSED assessed; no upstream, not assessed: $NOUP)"
+fi   # ALIGN_MODE: level with the candidate, or with each upstream
 
 # ── the INSTALLED UberSDR decoders come from the pin sigmond now names ──
 # The checks above read git; a checkout moved to the new pin beside the old
@@ -1306,6 +1468,10 @@ doctor_pairs "$WORK/doctor-post.txt" "$WORK/pairs-post.txt"
 assert_pairs_parsed "post-update doctor" "$WORK/pairs-post.txt" "$WORK/doctor-post.txt"
 say "post-update smd doctor exit $DOCTOR_POST_RC; finding kinds: $(tr '\n' ' ' < "$WORK/kinds-post.txt")"
 pair_verdict "$WORK/pairs-pre.txt" "$WORK/pairs-post.txt" > "$WORK/pairs-new.txt"
+if [ "$ALIGN_MODE" = 1 ]; then
+    CAND_DRIFT="$(cand_new_drift_pass "$WORK/pairs-new.txt" "$WORK/doctor-post.txt")"
+    [ -z "$CAND_DRIFT" ] || say "new in the candidate, not in $IMGBASE's manifest: doctor's drift on $CAND_DRIFT is expected until the release is blessed"
+fi
 sed -n 's/^WARN|\([^ ]*\) \(.*\)$/WARN: the update left a new \2 finding on \1 (ownership ruling, mjh 2026-10-24: smd doctor --fix repairs it; not a failure)/p' "$WORK/pairs-new.txt" \
     | while IFS= read -r l; do say "$l"; done
 NEWW="$(grep -c '^WARN|' "$WORK/pairs-new.txt")"
@@ -2779,7 +2945,14 @@ say "manifest landed in the guest at $GMANIFEST, sha256 verified ✓"
 
 gx_ok 600 f2-adopt "smd admin manifest adopt $GMANIFEST --allow-superset --apply" "manifest adopt --allow-superset --apply"
 sed 's/^/      /' "$WORK/f2-adopt.out"
-if [ "$GX_RC" -ne 0 ]; then
+F_CAND_ONLY=0
+if [ "$GX_RC" -ne 0 ] && [ "$ALIGN_MODE" = 1 ] && adopt_only_cand_new "$WORK/f2-adopt.out"; then
+    # The candidate adds components the base manifest lacks (cand_new), and
+    # adopt refuses nothing else: every other component matched or proved a
+    # superset.  A refused adopt writes nothing, so the base manifest stays.
+    F_CAND_ONLY=1
+    say "adopt refused only the components the candidate adds ($(cand_new)), as it must: the base manifest predates them; every other component matches or is a verified superset ✓"
+elif [ "$GX_RC" -ne 0 ]; then
     # plan_adopt refuses on ANY live component absent from the manifest
     # ("installed live (<sha>) but not in the manifest" — manifest_adopt.py
     # ~:104), and --allow-superset does not cover that case: it reasons
@@ -2787,19 +2960,21 @@ if [ "$GX_RC" -ne 0 ]; then
     # component added to main after the image was cut therefore refuses an
     # otherwise perfect adopt.  That is a fact about the calendar, not an
     # update defect, and it must not be reported as one.
-    LIVE_ONLY="$(sed -n 's/^.*\([A-Za-z0-9_.-]\+\): installed live (.*) but not in the manifest.*$/\1/p' "$WORK/f2-adopt.out" | tr '\n' ' ')"
+    LIVE_ONLY="$(adopt_refused_names "$WORK/f2-adopt.out")"
     if [ -n "$LIVE_ONLY" ]; then
         fatal "$WORK/f2-adopt.out" "adopt refused because the COMPONENT SET changed between $IMGBASE and $TARGET: $LIVE_ONLY installed live but absent from the blessed manifest. This is not an update defect — --allow-superset reasons about ancestry within a component, never about components the image predates. Re-run this rig against an image built after those components landed."
     fi
     fatal "$WORK/f2-adopt.out" "smd admin manifest adopt --allow-superset --apply exited $GX_RC — the updated guest is not even a sanctioned superset of the blessed baseline"
 fi
-grep -q 'plan OK' "$WORK/f2-adopt.out" \
+[ "$F_CAND_ONLY" = 1 ] || grep -q 'plan OK' "$WORK/f2-adopt.out" \
     || fatal "$WORK/f2-adopt.out" "adopt exited 0 without printing 'plan OK' — the verb's contract changed"
 # Superset presence is REPORTED, never asserted: whether main has moved past
 # the image between the build and this run is a property of the calendar,
 # not of the product.  Asserting it would make the rig fail on the one day
 # a release is tested the hour it is cut.
-if grep -q 'sanctioned superset' "$WORK/f2-adopt.out"; then
+if [ "$F_CAND_ONLY" = 1 ]; then
+    :
+elif grep -q 'sanctioned superset' "$WORK/f2-adopt.out"; then
     say "adopt: sanctioned superset — main has moved past the image, ancestry-verified ✓"
 else
     say "adopt: exact match — main has not moved past $IMGBASE since it was built"
@@ -2923,10 +3098,16 @@ say "every one of the $MROWS manifest components is live at its blessed sha ✓"
 # ── the round-trip proof: a STRICT adopt, no superset flag ─────────────
 gx_ok 600 g5-adopt-strict "smd admin manifest adopt $GMANIFEST --apply" "manifest adopt (STRICT)"
 sed 's/^/      /' "$WORK/g5-adopt-strict.out"
+if [ "$GX_RC" -ne 0 ] && [ "$ALIGN_MODE" = 1 ] && adopt_only_cand_new "$WORK/g5-adopt-strict.out"; then
+    # restore leaves a component the base release never had in place, as a
+    # stray (plan_restore), so strict adopt refuses it and nothing else.
+    say "round trip closed for every component of $IMGBASE: strict adopt refuses only the strays the candidate added ($(cand_new)), which restore leaves in place by design ✓"
+else
 [ "$GX_RC" -eq 0 ] || fatal "$WORK/g5-adopt-strict.out" "STRICT smd admin manifest adopt --apply exited $GX_RC after the restore — the round trip did not close"
 grep -q 'plan OK' "$WORK/g5-adopt-strict.out" \
     || fatal "$WORK/g5-adopt-strict.out" "strict adopt exited 0 without 'plan OK'"
 say "round trip closed: strict adopt (no --allow-superset) accepts the restored tree ✓"
+fi
 
 # ── doctor after the rollback ──────────────────────────────────────────
 gx_ok 900 g6-doctor 'smd doctor' "post-restore: smd doctor"
@@ -2986,6 +3167,10 @@ RB_BAD="$(printf '%s\n' "$RB_ALLOW" | grep -xE 'radiod-dropins-missing|qga-dropi
 # Per component, as in PHASE E, and under the same ownership ruling
 # (PAIR_WARN_KINDS).
 pair_verdict "$WORK/pairs-pre.txt" "$WORK/pairs-restored.txt" detached $RB_ALLOW > "$WORK/pairs-new-restored.txt"
+if [ "$ALIGN_MODE" = 1 ]; then
+    CAND_DRIFT="$(cand_new_drift_pass "$WORK/pairs-new-restored.txt" "$WORK/doctor-post-restore.txt")"
+    [ -z "$CAND_DRIFT" ] || say "the restore left the candidate's new components in place (strays): doctor's drift on $CAND_DRIFT is expected"
+fi
 sed -n 's/^WARN|\([^ ]*\) \(.*\)$/WARN: the rollback left a new \2 finding on \1 (ownership ruling, mjh 2026-10-24: smd doctor --fix repairs it; not a failure)/p' "$WORK/pairs-new-restored.txt" \
     | while IFS= read -r l; do say "$l"; done
 NEWGW="$(grep -c '^WARN|' "$WORK/pairs-new-restored.txt")"
@@ -3167,6 +3352,31 @@ say "════ PHASE G-ter: a second update leaves both split keys in place �
 # checkout's owner, onto the branch E recorded, at the SHA the restore left
 # (ruling C24-1; see sp2u_reattach_plan).  Then the update below pulls
 # forward, as it would on a station after align.
+if [ "$ALIGN_MODE" = 1 ]; then
+# A pinned station rolls forward again with align itself, which needs no
+# branch to stand on, so step 0 has nothing to stand in for.
+say "── G-ter: the second forward roll is smd align --manifest; no re-attach"
+gx_ok 3600 gt1-align-apply "systemd-run --quiet --wait --pipe --collect --unit=rig-align-apply2 /bin/bash -lc 'smd align --manifest $GCAND --apply'" "smd align --manifest --apply (second)"
+GT_RC="$GX_RC"
+# The verdicts below read the second roll's output under the update's name.
+cp "$WORK/gt1-align-apply.out" "$WORK/gt1-update-apply.out"
+sed 's/^/      /' "$WORK/gt1-update-apply.out" | tail -15
+grep -q 'Traceback (most recent call last)' "$WORK/gt1-update-apply.out" \
+    && fatal "$WORK/gt1-update-apply.out" "the second smd align --apply printed a Python traceback"
+[ "$GT_RC" = 0 ] || fatal "$WORK/gt1-update-apply.out" "the second smd align --manifest --apply exited $GT_RC"
+say "second smd align --apply exit 0"
+# The sink verdict reads "did the second roll bring sigmond and hs-uploader
+# forward" from [pull] lines, which align does not print.  Here the answer is
+# the live commit: a checkout the restore moved, back at the candidate's row,
+# is one the roll moved.
+gx_ok 300 gt1-version 'smd version' "G-ter: smd version after the second align"
+components_rows "$GX_OUT" "$WORK/live-gter.rows"
+for c in sigmond hs-uploader; do
+    sl="$(sha_of "$WORK/live-gter.rows" "$c")"; sc="$(sha_of "$WORK/candidate.rows" "$c")"
+    grep -q "^MOVED|$c|" "$WORK/g3-moved.facts" 2>/dev/null || continue
+    if [ -n "$sl" ] && [ -n "$sc" ] && sha_equal "$sl" "$sc"; then echo "  [pull] $c"; fi
+done >> "$WORK/gt1-update-apply.out"
+else
 say "── G-ter step 0: re-attach the checkouts the restore moved (stands in for smd align)"
 sp2u_reattach_plan "$WORK/g3-moved.facts" "$WORK/branches-at-e.txt" > "$WORK/gt0-reattach.plan"
 sed 's/^/      /' "$WORK/gt0-reattach.plan"
@@ -3207,6 +3417,7 @@ else
         *) fatal "$WORK/gt1-update-apply.out" "the second smd update --apply exited $GT_RC" ;;
     esac
 fi
+fi   # ALIGN_MODE: the second forward roll
 gx_ok 900 gt2-manifest 'smd admin uploader manifest --write --enable' "G-ter: smd admin uploader manifest --write --enable"
 sed 's/^/      /' "$WORK/gt2-manifest.out"
 [ "$GX_RC" -eq 0 ] || fatal "$WORK/gt2-manifest.out" "the second manifest step exited $GX_RC"
