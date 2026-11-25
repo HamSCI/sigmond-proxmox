@@ -43,6 +43,15 @@ install, and on the first line of the console panel.
 - Optional: an RM3100 magnetometer, a TS-1 time injector, a local
   GPS-disciplined time server. The station finds them by itself.
 
+**Before you start: the BIOS.**  A few settings live only in the
+computer's firmware, and you will sit at its console anyway.  Set them
+before the install: graphics memory to 64 MB (3-4 GB more for the
+station), power-on after a power cut, and Fast Boot off.  The list by
+platform, and how to check each one afterwards, lives in sigmond's
+[station firmware guide](https://github.com/HamSCI/sigmond/blob/main/docs/station-firmware.md).
+Your hardware may vary from what it describes; when it does, please
+report what you found, as the guide asks.
+
 Plug the receiver and GPS clock in **before the first boot**. Anything
 missing does not stop the install; you add it later (§7).
 

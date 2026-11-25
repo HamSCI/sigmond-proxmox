@@ -3291,6 +3291,7 @@ if [ -n "$VRAM_MB" ] && [ "$VRAM_MB" -gt 512 ]; then
   say "import: WARN the BIOS reserves ${VRAM_MB} MB of RAM for the integrated GPU; set UMA Frame Buffer Size to 64 MB at the console, then run pm-memory --apply (the VM gains about ${VRAM_MB} MB at its next restart)"
 fi
 [ -f "$SIG/scripts/proxmox/pm-memory.py" ] && install -m 755 "$SIG/scripts/proxmox/pm-memory.py" /usr/local/sbin/pm-memory
+[ -f "$SIG/scripts/proxmox/pm-firmware.py" ] && install -m 755 "$SIG/scripts/proxmox/pm-firmware.py" /usr/local/sbin/pm-firmware
 LAYOUT_OK=0
 if [ -x "$SIG/scripts/proxmox/host-discover.sh" ]; then
   declare -A KV
