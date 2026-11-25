@@ -2,7 +2,7 @@
 
 > **Audience:** operator
 > **Status:** current
-> **Verified against:** sigmond v3.94 (blessed 2026-11-21): a release now lives in sigmond, the image repo carries the name sigmond-proxmox, each station reports how it differs from its release, and every release passes a bare-metal install test.  What each release changed, and how it was proven: [CHANGELOG.md](https://github.com/HamSCI/sigmond/blob/main/CHANGELOG.md).
+> **Verified against:** sigmond v3.95 (blessed 2026-11-25): a release of fixes (ka9q-web plays audio again, the raw archive places each batch by its first sample, chirp-recorder joins the release, align waits for a busy station), checked on the rig and on two canary stations.  What each release changed, and how it was proven: [CHANGELOG.md](https://github.com/HamSCI/sigmond/blob/main/CHANGELOG.md).
 > **Canonical for:** burning, booting and first-boot wizard of the appliance image
 
 Day-2 operation, troubleshooting beyond §11, remote access and what-not-to-touch live in the [Operator guide](https://github.com/HamSCI/sigmond/blob/main/docs/operator/README.md).
@@ -101,8 +101,8 @@ nothing.
 
 **By hand:** ask your fleet admin for the current release — or download links for it:
 
-- `sigmond-appliance-v3.93-20261118-release.img`  (about 6.1 GB)
-- `sigmond-appliance-v3.93-20261118-release.sha256`  (its checksum)
+- `sigmond-v3.95-20261124-release.img`  (about 6.2 GB)
+- `sigmond-v3.95-20261124-release.sha256`  (its checksum)
 
 Each release carries its own version and date in the filename; use the names
 you were given wherever this guide shows one.
@@ -111,7 +111,7 @@ The image is published **uncompressed** (`.img`) — there is nothing to
 decompress. With both files in one folder, check it:
 
 ```
-sha256sum -c sigmond-appliance-v3.93-20261118-release.sha256
+sha256sum -c sigmond-v3.95-20261124-release.sha256
 ```
 
 ---
@@ -126,7 +126,7 @@ refuses the disk your computer runs from, and reads the stick back to compare
 every byte:
 
 ```
-./flash-usb.sh sigmond-appliance-v3.93-20261118-release.img
+./flash-usb.sh sigmond-v3.95-20261124-release.img
 ```
 
 **Any OS, graphical:** balenaEtcher (balena.io/etcher) or Raspberry Pi Imager
@@ -136,7 +136,7 @@ handout is [docs/flash-usb-mac.md](docs/flash-usb-mac.md).
 **Command line (Linux):**
 ```
 lsblk -dno NAME,SIZE,TRAN,RM,MODEL     # find the stick: check size, removable
-sudo dd if=sigmond-appliance-v3.93-20261118-release.img of=/dev/sdX bs=4M \
+sudo dd if=sigmond-v3.95-20261124-release.img of=/dev/sdX bs=4M \
         oflag=direct conv=fsync status=progress
 sync
 ```
@@ -146,12 +146,12 @@ sync
 ```
 diskutil list                      # find your stick, e.g. /dev/disk4
 diskutil unmountDisk /dev/disk4
-sudo dd if=sigmond-appliance-v3.93-20261118-release.img of=/dev/rdisk4 bs=4m
+sudo dd if=sigmond-v3.95-20261124-release.img of=/dev/rdisk4 bs=4m
 ```
 
 **Verify a hand-written stick** by reading back exactly the image's size:
 ```
-IMG=sigmond-appliance-v3.93-20261118-release.img
+IMG=sigmond-v3.95-20261124-release.img
 sudo head -c "$(stat -c %s $IMG)" /dev/sdX | sha256sum
 sha256sum $IMG                     # the two hashes must match
 ```
