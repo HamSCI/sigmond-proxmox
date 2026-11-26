@@ -3561,7 +3561,10 @@ if [ -z "$DISK" ]; then
     qm destroy "$VMID" --purge 2>/dev/null; rm -f /tmp/decoder.qcow2; exit 1
 fi
 cat "$_IMPLOG" >>"$LOG" 2>/dev/null; rm -f "$_IMPLOG"
-qm set "$VMID" --scsi0 "$DISK" --boot order=scsi0
+# discard=on: without it QEMU drops the guest's trims and the thin pool only
+# grows (B4 2026-11-26: 246 GiB held for 195 GiB used).  ssd=1 lets the guest
+# see a non-rotating disk, as KFS-OMNI's hand-set disk already does.
+qm set "$VMID" --scsi0 "$DISK,discard=on,ssd=1" --boot order=scsi0
 # size the decoder disk to the host's storage: the full timing chain's
 # 6-channel raw archive needs ~77G baseline (metrology preflight starved
 # at a fixed 32G, 2026-07-29). Thin-provisioned, so generosity is cheap:
